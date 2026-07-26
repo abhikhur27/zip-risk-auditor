@@ -12,6 +12,8 @@ struct CliOptions {
     json_out: Option<PathBuf>,
     markdown_out: Option<PathBuf>,
     ratio_threshold: f64,
+    total_size_threshold_mb: f64,
+    fail_on_risk: bool,
     top: usize,
 }
 
@@ -20,6 +22,7 @@ struct AuditReport {
     generated_at: String,
     inputs: Vec<String>,
     ratio_threshold: f64,
+    total_size_threshold_mb: f64,
     archives_scanned: usize,
     flagged_archives: usize,
     rows: Vec<ArchiveFinding>,
@@ -36,6 +39,7 @@ struct ArchiveFinding {
     executable_entries: usize,
     nested_archives: usize,
     max_expansion_ratio: f64,
+    archive_expansion_ratio: f64,
     total_uncompressed_bytes: u64,
     total_compressed_bytes: u64,
     signals: Vec<String>,
@@ -57,7 +61,11 @@ fn run() -> Result<(), String> {
 
     let mut rows = Vec::new();
     for archive_path in &archives {
-        rows.push(analyze_archive(archive_path, options.ratio_threshold)?);
+        rows.push(analyze_archive(
+            archive_path,
+            options.ratio_threshold,
+            options.total_size_threshold_mb,
+        )?);
     }
 
     rows.sort_by(|left, right| {
@@ -76,6 +84,7 @@ fn run() -> Result<(), String> {
             .map(|path| path.display().to_string())
             .collect(),
         ratio_threshold: options.ratio_threshold,
+        total_size_threshold_mb: options.total_size_threshold_mb,
         archives_scanned: rows.len(),
         flagged_archives: rows.iter().filter(|row| row.risk_score > 0).count(),
         rows,
@@ -96,6 +105,13 @@ fn run() -> Result<(), String> {
         println!("Wrote Markdown report: {}", path.display());
     }
 
+    if options.fail_on_risk && report.flagged_archives > 0 {
+        return Err(format!(
+            "{} archive(s) crossed the configured risk checks.",
+            report.flagged_archives
+        ));
+    }
+
     Ok(())
 }
 
@@ -108,6 +124,8 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
     let mut json_out = None;
     let mut markdown_out = None;
     let mut ratio_threshold = 15.0;
+    let mut total_size_threshold_mb = 256.0;
+    let mut fail_on_risk = false;
     let mut top = 5usize;
     let mut index = 0usize;
 
@@ -138,6 +156,19 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                     return Err("--ratio-threshold must be greater than 1.0.".to_string());
                 }
             }
+            "--total-size-threshold-mb" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(usage)?;
+                total_size_threshold_mb = value
+                    .parse::<f64>()
+                    .map_err(|_| "--total-size-threshold-mb must be a number.".to_string())?;
+                if total_size_threshold_mb <= 0.0 {
+                    return Err("--total-size-threshold-mb must be greater than 0.".to_string());
+                }
+            }
+            "--fail-on-risk" => {
+                fail_on_risk = true;
+            }
             "--top" => {
                 index += 1;
                 let value = args.get(index).ok_or_else(usage)?;
@@ -163,6 +194,8 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
         json_out,
         markdown_out,
         ratio_threshold,
+        total_size_threshold_mb,
+        fail_on_risk,
         top,
     })
 }
@@ -171,7 +204,7 @@ fn usage() -> String {
     [
         "Usage:",
         "  zip-risk-auditor --input <path> [--input <path> ...] [--json-out report.json] [--markdown-out report.md]",
-        "                    [--ratio-threshold 15] [--top 5]",
+        "                    [--ratio-threshold 15] [--total-size-threshold-mb 256] [--fail-on-risk] [--top 5]",
     ]
     .join("\n")
 }
@@ -216,7 +249,11 @@ fn is_zip_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn analyze_archive(path: &Path, ratio_threshold: f64) -> Result<ArchiveFinding, String> {
+fn analyze_archive(
+    path: &Path,
+    ratio_threshold: f64,
+    total_size_threshold_mb: f64,
+) -> Result<ArchiveFinding, String> {
     let file = File::open(path).map_err(|error| format!("Could not open {}: {error}", path.display()))?;
     let mut archive = ZipArchive::new(file)
         .map_err(|error| format!("Could not read {} as a zip archive: {error}", path.display()))?;
@@ -271,6 +308,15 @@ fn analyze_archive(path: &Path, ratio_threshold: f64) -> Result<ArchiveFinding, 
     }
 
     let duplicate_paths = normalized_paths.values().filter(|count| **count > 1).count();
+    let archive_expansion_ratio = if total_compressed_bytes == 0 {
+        if total_uncompressed_bytes == 0 {
+            1.0
+        } else {
+            total_uncompressed_bytes as f64
+        }
+    } else {
+        total_uncompressed_bytes as f64 / total_compressed_bytes as f64
+    };
     let mut signals = Vec::new();
     let mut risk_score = 0u32;
 
@@ -302,12 +348,22 @@ fn analyze_archive(path: &Path, ratio_threshold: f64) -> Result<ArchiveFinding, 
         risk_score += 18;
     }
 
-    if total_compressed_bytes > 0 {
-        let archive_ratio = total_uncompressed_bytes as f64 / total_compressed_bytes as f64;
-        if archive_ratio >= ratio_threshold * 0.85 {
-            signals.push(format!("archive-wide expansion ratio {:.1}x", archive_ratio));
-            risk_score += 8;
-        }
+    if archive_expansion_ratio >= ratio_threshold * 0.85 {
+        signals.push(format!(
+            "archive-wide expansion ratio {:.1}x",
+            archive_expansion_ratio
+        ));
+        risk_score += 8;
+    }
+
+    let total_size_threshold_bytes = (total_size_threshold_mb * 1024.0 * 1024.0) as u64;
+    if total_uncompressed_bytes >= total_size_threshold_bytes {
+        signals.push(format!(
+            "total uncompressed size {:.1} MB crossed threshold {:.1} MB",
+            bytes_to_mb(total_uncompressed_bytes),
+            total_size_threshold_mb
+        ));
+        risk_score += 12;
     }
 
     if signals.is_empty() {
@@ -324,6 +380,7 @@ fn analyze_archive(path: &Path, ratio_threshold: f64) -> Result<ArchiveFinding, 
         executable_entries,
         nested_archives,
         max_expansion_ratio: (max_expansion_ratio * 10.0).round() / 10.0,
+        archive_expansion_ratio: (archive_expansion_ratio * 10.0).round() / 10.0,
         total_uncompressed_bytes,
         total_compressed_bytes,
         signals,
@@ -382,6 +439,7 @@ fn print_console(report: &AuditReport, top: usize) {
     println!("Archives scanned:   {}", report.archives_scanned);
     println!("Flagged archives:   {}", report.flagged_archives);
     println!("Ratio threshold:    {:.1}x", report.ratio_threshold);
+    println!("Size threshold:     {:.1} MB", report.total_size_threshold_mb);
     println!();
 
     if report.rows.is_empty() {
@@ -410,18 +468,23 @@ fn render_markdown(report: &AuditReport) -> String {
     output.push_str(&format!("- Generated: `{}`\n", report.generated_at));
     output.push_str(&format!("- Archives scanned: `{}`\n", report.archives_scanned));
     output.push_str(&format!("- Flagged archives: `{}`\n", report.flagged_archives));
-    output.push_str(&format!("- Ratio threshold: `{:.1}x`\n\n", report.ratio_threshold));
-    output.push_str("| Archive | Risk | Traversal | Duplicate paths | Executables | Max ratio |\n");
-    output.push_str("| --- | ---: | ---: | ---: | ---: | ---: |\n");
+    output.push_str(&format!("- Ratio threshold: `{:.1}x`\n", report.ratio_threshold));
+    output.push_str(&format!(
+        "- Total size threshold: `{:.1} MB`\n\n",
+        report.total_size_threshold_mb
+    ));
+    output.push_str("| Archive | Risk | Traversal | Duplicate paths | Executables | Max ratio | Archive ratio |\n");
+    output.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for row in &report.rows {
         output.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.1}x |\n",
+            "| {} | {} | {} | {} | {} | {:.1}x | {:.1}x |\n",
             escape_pipes(&row.archive_path),
             row.risk_score,
             row.traversal_entries,
             row.duplicate_paths,
             row.executable_entries,
-            row.max_expansion_ratio
+            row.max_expansion_ratio,
+            row.archive_expansion_ratio
         ));
     }
     output.push_str("\n## Findings\n\n");
@@ -437,10 +500,11 @@ fn render_markdown(report: &AuditReport) -> String {
             row.nested_archives
         ));
         output.push_str(&format!(
-            "- Size profile: compressed `{}` bytes, uncompressed `{}` bytes, max entry ratio `{:.1}x`\n\n",
+            "- Size profile: compressed `{}` bytes, uncompressed `{}` bytes, max entry ratio `{:.1}x`, archive ratio `{:.1}x`\n\n",
             row.total_compressed_bytes,
             row.total_uncompressed_bytes,
-            row.max_expansion_ratio
+            row.max_expansion_ratio,
+            row.archive_expansion_ratio
         ));
     }
     output
@@ -466,5 +530,63 @@ fn iso_timestamp() -> String {
     {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+    use zip::CompressionMethod;
+    use zip::ZipWriter;
+    use zip::write::FileOptions;
+
+    #[test]
+    fn normalize_archive_path_removes_dot_segments() {
+        assert_eq!(normalize_archive_path("./docs//report.txt"), "docs/report.txt");
+    }
+
+    #[test]
+    fn traversal_and_absolute_entries_are_detected() {
+        assert!(is_traversal_entry("../AppData/startup.bat"));
+        assert!(is_absolute_entry("/Windows/System32/calc.exe"));
+        assert!(is_absolute_entry("C:/Windows/System32/cmd.exe"));
+    }
+
+    #[test]
+    fn executable_and_nested_archive_detection_handles_common_extensions() {
+        assert!(is_executable_like("payload/run.ps1"));
+        assert!(is_nested_archive("drop/vendor.jar"));
+        assert!(!is_nested_archive("notes/readme.md"));
+    }
+
+    #[test]
+    fn analyze_archive_flags_size_and_payload_risks() {
+        let temp = tempdir().unwrap();
+        let archive_path = temp.path().join("sample.zip");
+        let file = File::create(&archive_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("../startup.bat", options).unwrap();
+        writer.write_all(&vec![b'A'; 2048]).unwrap();
+        writer.start_file("nested/tool.zip", options).unwrap();
+        writer.write_all(b"fake nested zip").unwrap();
+        writer.finish().unwrap();
+
+        let finding = analyze_archive(&archive_path, 2.0, 0.001).unwrap();
+        assert!(finding.risk_score > 0);
+        assert_eq!(finding.traversal_entries, 1);
+        assert_eq!(finding.executable_entries, 1);
+        assert_eq!(finding.nested_archives, 1);
+        assert!(finding
+            .signals
+            .iter()
+            .any(|signal| signal.contains("total uncompressed size")));
     }
 }

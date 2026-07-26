@@ -19,6 +19,7 @@ This tool turns that first-pass inspection into one repeatable command.
 - Scans one or more `.zip` files or walks directories recursively for zip archives
 - Flags path traversal and absolute-path extraction entries
 - Measures per-entry and per-archive expansion ratios
+- Flags oversized expanded payloads before extraction blows up a workstation or CI runner
 - Counts executable/script payloads and nested archives
 - Detects duplicate normalized entry paths inside each archive
 - Exports JSON and Markdown briefs for handoff or cleanup notes
@@ -33,6 +34,12 @@ Tighten the zip-bomb threshold and show more archives in the console:
 
 ```bash
 cargo run -- --input C:\Users\abhim\Downloads --ratio-threshold 12 --top 8
+```
+
+Fail automation when risky archives are found:
+
+```bash
+cargo run -- --input C:\Users\abhim\Downloads --fail-on-risk --total-size-threshold-mb 128
 ```
 
 ## Output
